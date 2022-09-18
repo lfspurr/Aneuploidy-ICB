@@ -1,0 +1,446 @@
+---
+title: "Code for Spurr et al, Nature Genetics 2022"
+output: html_notebook
+---
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(survminer)
+library(survival)
+library(ggridges)
+library(qvalue)
+```
+
+# Load data
+```{r}
+sample_data <- fread("tmb_mskcc_2018/data_clinical_sample.txt") %>%
+  filter(CANCER_TYPE != "Skin Cancer, Non-Melanoma")
+patient_data <- fread("tmb_mskcc_2018/data_clinical_patient.txt")
+
+aneuploidy_scores <- fread("genie_071822_0.1_aneuploidy_scores.txt")
+ascna_calls <- fread("genie_071822_0.1_arm_level_calls.txt") %>%
+  filter(grepl("MSK", sample)) %>%
+  mutate(sample = gsub("GENIE-MSK-", "", sample))
+
+mskcc_df <- left_join(sample_data, patient_data) %>% 
+  left_join(aneuploidy_scores %>% mutate(sample = gsub("GENIE-MSK-", "", sample)), by = c("SAMPLE_ID" = "sample")) %>%
+  filter(CANCER_TYPE != "Skin Cancer, Non-Melanoma") %>%
+  group_by(CANCER_TYPE) %>%
+  drop_na(TMB_NONSYNONYMOUS, aneuploidy_score) %>%
+  mutate(OS_STATUS = as.numeric(substr(OS_STATUS, 1, 1)),
+         OS_MONTHS = as.numeric(OS_MONTHS))
+
+mskcc_df <- mskcc_df %>% group_by(CANCER_TYPE) %>% mutate(
+         aneuploidy_score_bin = ifelse(aneuploidy_score >= quantile(aneuploidy_score, 0.5), "high", "low"),
+         tmb_bin = ifelse(TMB_NONSYNONYMOUS >= quantile(TMB_NONSYNONYMOUS, 0.8), "high", "low"),
+         tmb_bin_10 = ifelse(TMB_NONSYNONYMOUS >= 10, "high", "low"))
+
+segs <- fread("genie_data_cna_hg19.seg")
+segs2 <- segs %>% filter(grepl("MSK", ID)) %>%
+  mutate(ID = gsub("GENIE-MSK-", "", ID)) %>%
+  filter(ID %in% mskcc_df$SAMPLE_ID)
+segs2 <- segs2 %>% mutate(seg_length = loc.end - loc.start)
+fga <- segs2 %>% group_by(ID) %>%
+  summarize(FGA = sum(seg_length[abs(seg.mean) >= 0.1]) / sum(seg_length))
+
+mskcc_df <- left_join(mskcc_df, fga, by = c("SAMPLE_ID" = "ID"))
+```
+
+# Forest plot (continuous variables)
+```{r}
+mva_df <- mskcc_df %>% as.data.frame()
+mva_df$SEX <- relevel(as.factor(mva_df$SEX), ref = "Male")
+mva_df$SAMPLE_TYPE <- relevel(as.factor(mva_df$SAMPLE_TYPE), ref = "Primary")
+mva_df$tmb_bin <- relevel(as.factor(mva_df$tmb_bin), ref = "low")
+mva_df$aneuploidy_score_bin <- relevel(as.factor(mva_df$aneuploidy_score_bin), ref = "low")
+
+
+mva_df <- mva_df %>% rename(TMB = TMB_NONSYNONYMOUS,
+                            `Aneuploidy score` = aneuploidy_score,
+                            Age = AGE_AT_SEQ_REPORT,
+                            Sex = SEX,
+                            `Drug class` = DRUG_TYPE,
+                            `Sample type` = SAMPLE_TYPE,
+                            `TMB >= 80th %ile` = tmb_bin,
+                            `Aneuploidy score >= 50th %ile` = aneuploidy_score_bin)
+
+model <- coxph(Surv(OS_MONTHS, OS_STATUS) ~ `TMB` + `Aneuploidy score` + `Drug class` + `Sample type` + Age + Sex, data = mva_df)
+ggforest(model)
+ggsave("Forest_MVA.pdf", width = 7, height = 5)
+
+model <- coxph(Surv(OS_MONTHS, OS_STATUS) ~ `TMB >= 80th %ile` + `Aneuploidy score >= 50th %ile` + `Drug class` + `Sample type` + Age + Sex, data = mva_df)
+ggforest(model)
+ggsave("Forest_MVA_Bin.pdf", width = 7, height = 5)
+```
+
+# Forest plot and AS distributions by cancer type
+```{r}
+surv_results <- mskcc_df
+surv_results <- bind_rows(surv_results, surv_results %>% mutate(CANCER_TYPE = "All",
+                                                                CANCER_TYPE_DETAILED = "All")) %>%
+  drop_na(TMB_NONSYNONYMOUS, aneuploidy_score)
+
+surv_results <- split(surv_results, surv_results$CANCER_TYPE)
+surv_results_ <- bind_rows(lapply(surv_results, function(d) {
+  if(nrow(d) < 10) return(data.frame())
+  s = summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ aneuploidy_score + TMB_NONSYNONYMOUS + DRUG_TYPE, data = d))
+  data.frame(CANCER_TYPE = d$CANCER_TYPE[1],
+             CANCER_TYPE_DETAILED = d$CANCER_TYPE_DETAILED[1],
+             hr_tmb = s$coefficients[2, 2],
+             hr_aneuploidy = s$coefficients[1,2],
+             p_tmb = s$coefficients[2,5],
+             p_aneuploidy = s$coefficients[1,5],
+             upper_tmb = s$conf.int[2,3],
+             lower_tmb = s$conf.int[2,4],
+             upper_aneuploidy = s$conf.int[1,3],
+             lower_aneuploidy = s$conf.int[1,4],
+             n = nrow(d), 
+             model_p = s$logtest[3])
+}))
+```
+
+```{r}
+surv_results_plot <- surv_results_ %>% gather(variable, value, starts_with("p"), contains("hr"), 
+                                              contains("upper"), contains("lower")) %>%
+  separate(variable, into = c("variable", "type")) %>%
+  spread(variable, value) %>%
+    mutate(type = ifelse(type == "aneuploidy", "Aneuploidy score", "TMB")) %>%
+  arrange(type, (hr))
+order <- unique(surv_results_plot$CANCER_TYPE)
+order <-c("All", order[order != "All"])
+surv_results_plot$CANCER_TYPE <- factor(surv_results_plot$CANCER_TYPE, levels = order)
+```
+
+```{r}
+ggplot(surv_results_plot, 
+       aes(y = CANCER_TYPE, x = hr, color = type)) +
+  geom_point(shape = 15) +
+  geom_segment(aes(y = CANCER_TYPE, yend = CANCER_TYPE, x = lower, xend = upper)) +
+  scale_color_manual(values = c("#005F73", "#EE9B00")) +
+  facet_wrap(~type, scales = "free_x") +
+  scale_x_log10() +
+  theme_pubr() +
+  geom_vline(xintercept = 1, lty = 2, color = "gray65") +
+  labs(y = "", x = "Multivariable hazard ratio") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("Forest_AS_TMB_MSKCC.pdf", width = 8, height = 5)
+
+
+cols <- c("gray85", "#001219", "#005f73", "#0a9396", "#94d2bd", "#e9d8a6", "#ee9b00", "#ca6702", "#bb3e03", "#ae2012", "#9b2226")
+ggplot(bind_rows(mskcc_df %>% filter(CANCER_TYPE %in% surv_results_plot$CANCER_TYPE),
+                 mskcc_df %>% filter(CANCER_TYPE %in% surv_results_plot$CANCER_TYPE) %>%
+                   mutate(CANCER_TYPE = "All")), 
+       aes(x = aneuploidy_score, y = CANCER_TYPE, fill = CANCER_TYPE)) + 
+  ggridges::geom_density_ridges2(quantile_lines = TRUE, quantiles = 2, vline_color = "gray65") +
+  scale_fill_manual(values = cols) +
+  theme_pubr() +
+  theme(legend.position = "none") +
+  labs(x = "Aneuploidy score", y = "Cancer type")
+ggsave("AS_Distribution_PanCan_MSKCC.pdf", width = 6, height = 4)
+```
+
+# AS cutoff analysis
+```{r}
+steps <- seq(0.1, 0.9, by = 0.1)
+
+quantile_thresh <- suppressWarnings(bind_rows(lapply(steps, function(step) {
+  temp <- mskcc_df %>% group_by(CANCER_TYPE) %>% 
+      mutate(aneuploidy_score_bin = ifelse(aneuploidy_score >= quantile(aneuploidy_score, step), "high", "low"),
+             tmb_bin = ifelse(TMB_NONSYNONYMOUS >= quantile(TMB_NONSYNONYMOUS, 0.8), "high", "low"))
+  
+  bind_rows(lapply(1:nrow(temp), function(i) {
+    temp_loo <- temp[-i,]
+    if(length(unique(temp_loo$aneuploidy_score_bin)) < 2) return()
+    s <- summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ aneuploidy_score_bin + tmb_bin + DRUG_TYPE, data = temp_loo))
+     data.frame(aneuploidy_thresh = step,
+            tmb_thresh = 0.8,
+            iteration = i,
+            hr_tmb = 1 / s$coefficients[2, 2],
+             hr_aneuploidy = 1 / s$coefficients[1,2],
+             p_tmb = s$coefficients[2,5],
+             p_aneuploidy = s$coefficients[1,5],
+             upper_tmb = 1 / s$conf.int[2,3],
+             lower_tmb = 1 / s$conf.int[2,4],
+             upper_aneuploidy = 1 / s$conf.int[1,3],
+             lower_aneuploidy = 1 / s$conf.int[1,4],
+            model_p = s$logtest[3])
+  }))
+})))
+
+loocv_results_p <- bind_rows(lapply(unique(quantile_thresh$aneuploidy_thresh), function(x) {
+  temp <- quantile_thresh %>% filter(aneuploidy_thresh == !!x)
+  m <- mean(temp$p_aneuploidy)
+  t <- qt(p = 0.025, df = nrow(temp) - 1, lower.tail = F)
+  se <- sd(temp$p_aneuploidy) / sqrt(nrow(temp))
+  marg <- t * se
+  list(aneuploidy_thresh = x,
+       mean_p = m,
+       lower_ci = m - marg,
+       upper_ci = m + marg)
+}))
+
+loocv_results_diff <- bind_rows(lapply(unique(quantile_thresh$aneuploidy_thresh), function(x) {
+  temp <- quantile_thresh %>% filter(aneuploidy_thresh == !!x)
+  m <- mean(temp$hr_aneuploidy)
+  t <- qt(p = 0.025, df = nrow(temp) - 1, lower.tail = F)
+  se <- sd(temp$hr_aneuploidy) / sqrt(nrow(temp))
+  marg <- t * se
+  list(aneuploidy_thresh = x,
+       mean_hr = m,
+       lower_ci = m - marg,
+       upper_ci = m + marg)
+}))
+
+
+loocv_results_comb <- bind_rows(loocv_results_p %>% mutate(type = "p") %>% dplyr::rename(mean = mean_p),
+                                loocv_results_diff %>% mutate(type = "hr") %>% dplyr::rename(mean = mean_hr)) %>%
+  mutate(Variable = ifelse(type == "p", "Mean log-rank p-value", "Mean hazard ratio"))
+```
+
+```{r}
+ggboxplot(quantile_thresh %>% select(aneuploidy_thresh, iteration, hr_aneuploidy, p_aneuploidy) %>%
+            filter(aneuploidy_thresh > 0.1 & aneuploidy_thresh < 0.9) %>%
+            mutate(p_aneuploidy = -log10(p_aneuploidy)) %>%
+         gather(var, value, hr_aneuploidy, p_aneuploidy) %>%
+                        mutate(var = ifelse(var == "p_aneuploidy", "-log10(Log-rank p-value)", "Hazard ratio")), 
+         x = "aneuploidy_thresh", y = "value", facet.by  = "var", scales = "free_y", fill = "var", palette = c("#EE9B00", "#9B2226"), ncol = 1, outlier.size = 1, strip.position = "right") +
+  labs(x = "Aneuploidy score threshold", y = "Value") +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = seq(1, 8, by = 1), color = "gray65", lty = 2)
+ggsave("LOOCV.pdf", width = 4, height = 6)  
+```
+
+```{r}
+quantile_plot <- mskcc_df %>% filter(CANCER_TYPE != "Skin Cancer, Non-Melanoma") %>%
+  group_by(CANCER_TYPE) %>% 
+      mutate(aneuploidy_score_bin = ifelse(aneuploidy_score >= quantile(aneuploidy_score, 0.5), "high", "low"),
+             tmb_bin = ifelse(TMB_NONSYNONYMOUS >= quantile(TMB_NONSYNONYMOUS, 0.8), "high", "low"),
+             tmb_as_group = paste0(aneuploidy_score_bin, " AS, ", tmb_bin, " TMB"))
+
+quantile_plot <- quantile_plot %>% select(SAMPLE_ID, OS_MONTHS, OS_STATUS, tmb_bin, tmb_as_group, DRUG_TYPE) %>%
+  as.data.frame()
+
+lines <- c("solid",  "dashed", "dashed", "solid", "dashed", "dashed")
+
+pdf("PanCan_AS-TMB_Thresh.pdf", width = 5, height = 6, onefile = F)
+ggsurvplot(survfit(Surv(OS_MONTHS, OS_STATUS) ~ tmb_as_group, data = quantile_plot), pval = T, risk.table = T,
+           palette = c("#9B2226","#001219", "#CA6702", "#005F73"),
+           risk.table.height = 0.3,
+           legend.labs = c("AS-H/TMB-H", "AS-H/TMB-L", "AS-L/TMB-H", "AS-L/TMB-L"),
+          pval.method = T, tables.y.text = F)
+dev.off()
+```
+
+# Impact of AS vs TMB
+```{r}
+cols <- c("white", "gray85", "#001219", "#005f73", "#0a9396", "#94d2bd", "#e9d8a6", "#ee9b00", "#ca6702", "#bb3e03", "#ae2012", "#9b2226")
+ggpaired(os_diff_tmb %>% rename(`High TMB` = twoyr_high_tmb,
+                                `Low TMB` = twoyr_low_tmb), 
+         cond1 = "High TMB", cond2 = "Low TMB", line.color = "CANCER_TYPE", line.size = 1,
+         fill = "gray65",
+         palette = cols, xlab = "TMB group", legend.title = "Cancer type", ylab = "Two-year overall survival") +
+  stat_compare_means(paired = T) +
+  theme(legend.position = "right") +
+  ylim(0, 1)
+ggsave("TMB_Surv_Comparison.pdf", width = 6, height = 5)
+
+ggpaired(os_diff_tmblow_as %>% rename(`Low TMB, High AS` = twoyr_low_tmb_high_as,
+                                `Low TMB, Low AS` = twoyr_low_tmb_low_as), 
+         cond1 = "Low TMB, High AS", cond2 = "Low TMB, Low AS", line.color = "CANCER_TYPE", line.size = 1,
+         fill = "gray65",
+         palette = cols, xlab = "AS group", legend.title = "Cancer type", ylab = "Two-year overall survival") +
+  stat_compare_means(paired = T) +
+  theme(legend.position = "right") +
+  ylim(0, 1)
+ggsave("TMB_AS_Surv_Comparison.pdf", width = 6, height = 5)
+```
+
+```{r}
+surv_results <- mskcc_df
+surv_results <- bind_rows(surv_results, surv_results %>% mutate(CANCER_TYPE = "All",
+                                                                CANCER_TYPE_DETAILED = "All")) %>%
+  drop_na(TMB_NONSYNONYMOUS, aneuploidy_score)
+surv_results$aneuploidy_score_bin <- relevel(factor(surv_results$aneuploidy_score_bin), ref = "low")
+surv_results$tmb_bin <- relevel(factor(surv_results$tmb_bin), ref = "low")
+
+surv_results <- split(surv_results, surv_results$CANCER_TYPE)
+surv_results_ <- bind_rows(lapply(surv_results, function(d) {
+  if(nrow(d) < 10) return(data.frame())
+  s = summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ aneuploidy_score_bin + tmb_bin + DRUG_TYPE, data = d))
+  data.frame(CANCER_TYPE = d$CANCER_TYPE[1],
+             CANCER_TYPE_DETAILED = d$CANCER_TYPE_DETAILED[1],
+             hr_tmb = s$coefficients[2, 2],
+             hr_aneuploidy = s$coefficients[1,2],
+             p_tmb = s$coefficients[2,5],
+             p_aneuploidy = s$coefficients[1,5],
+             upper_tmb = s$conf.int[2,3],
+             lower_tmb = s$conf.int[2,4],
+             upper_aneuploidy = s$conf.int[1,3],
+             lower_aneuploidy = s$conf.int[1,4],
+             n = nrow(d), 
+             model_p = s$logtest[3])
+}))
+
+surv_results_plot <- surv_results_ %>% gather(variable, value, starts_with("p"), contains("hr"), 
+                                              contains("upper"), contains("lower")) %>%
+  separate(variable, into = c("variable", "type")) %>%
+  spread(variable, value) %>%
+    mutate(type = ifelse(type == "aneuploidy", "Aneuploidy score", "TMB")) %>%
+  arrange(type, (hr))
+order <- unique(surv_results_plot$CANCER_TYPE)
+order <-c("All", order[order != "All"])
+surv_results_plot$CANCER_TYPE <- factor(surv_results_plot$CANCER_TYPE, levels = order)
+
+ggplot(surv_results_plot %>% filter(!is.infinite(lower)), 
+       aes(y = CANCER_TYPE, x = hr, color = type)) +
+  geom_point(shape = 15) +
+  geom_segment(aes(y = CANCER_TYPE, yend = CANCER_TYPE, x = lower, xend = upper)) +
+  scale_color_manual(values = c("#005F73", "#EE9B00")) +
+  facet_wrap(~type, scales = "free_x") +
+  scale_x_log10() +
+  theme_pubr() +
+  geom_vline(xintercept = 1, lty = 2, color = "gray65") +
+  labs(y = "", x = "Multivariable hazard ratio") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave("Forest_AS_TMB_MSKCC_THRESH.pdf", width = 8, height = 5)
+```
+
+# TMB vs AS correlation
+```{r}
+ggscatter(mskcc_df, 
+         y = "TMB_NONSYNONYMOUS", x = "aneuploidy_score",
+          color = "#CA6702",
+         xlab = "Aneuploidy score", ylab = "TMB") + 
+  stat_cor(method = "spearman") +
+  scale_y_log10()
+ 
+ggsave("TMB_AS_Corr.pdf", height = 4, width = 4)
+```
+
+# FGA vs AS
+```{r}
+surv_results_fga <- mskcc_df
+surv_results_fga <- bind_rows(surv_results_fga, surv_results_fga %>% mutate(CANCER_TYPE = "All",
+                                                                CANCER_TYPE_DETAILED = "All")) %>%
+  drop_na(TMB_NONSYNONYMOUS, aneuploidy_score, FGA)
+
+surv_results_fga <- split(surv_results_fga, surv_results_fga$CANCER_TYPE)
+surv_results_fga <- bind_rows(lapply(surv_results_fga, function(d) {
+  if(nrow(d) < 10) return(data.frame())
+  s = summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ aneuploidy_score + TMB_NONSYNONYMOUS + DRUG_TYPE, data = d))
+  df1 <- data.frame(CANCER_TYPE = d$CANCER_TYPE[1],
+             CANCER_TYPE_DETAILED = d$CANCER_TYPE_DETAILED[1],
+             hr_tmb = s$coefficients[2, 2],
+             hr_aneuploidy = s$coefficients[1,2],
+             p_tmb = s$coefficients[2,5],
+             p_aneuploidy = s$coefficients[1,5],
+             upper_tmb = s$conf.int[2,3],
+             lower_tmb = s$conf.int[2,4],
+             upper_aneuploidy = s$conf.int[1,3],
+             lower_aneuploidy = s$conf.int[1,4],
+             n = nrow(d), 
+             model_p = s$logtest[3],
+             method = "AS")
+  
+  s2 = summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ FGA + TMB_NONSYNONYMOUS + DRUG_TYPE, data = d))
+    df2 <- data.frame(CANCER_TYPE = d$CANCER_TYPE[1],
+             CANCER_TYPE_DETAILED = d$CANCER_TYPE_DETAILED[1],
+             hr_tmb = s2$coefficients[2, 2],
+             hr_aneuploidy = s2$coefficients[1,2],
+             p_tmb = s2$coefficients[2,5],
+             p_aneuploidy = s2$coefficients[1,5],
+             upper_tmb = s2$conf.int[2,3],
+             lower_tmb = s2$conf.int[2,4],
+             upper_aneuploidy = s2$conf.int[1,3],
+             lower_aneuploidy = s2$conf.int[1,4],
+             n = nrow(d), 
+             model_p = s2$logtest[3],
+             method = "FGA")
+    
+    bind_rows(df1, df2)
+}))
+```
+
+```{r}
+fga_as_comp <- surv_results_fga %>% select(CANCER_TYPE, hr_aneuploidy, p_aneuploidy, method) %>% 
+  mutate(hr_aneuploidy = ifelse(hr_aneuploidy < 1, 1 / hr_aneuploidy, hr_aneuploidy)) %>%
+  gather(var, val, hr_aneuploidy, p_aneuploidy) %>% 
+    mutate(val = ifelse(var == "hr_aneuploidy", val, -log10(val))) %>%
+  spread(method, val) %>%
+  mutate(var = ifelse(var == "hr_aneuploidy", "Multivariable hazard ratio", "-log10(P-value)")) %>%
+  as.data.frame() %>%
+  filter(CANCER_TYPE != "All",
+         var == "Multivariable hazard ratio")
+cols <- c("white", "gray85", "#001219", "#005f73", "#0a9396", "#94d2bd", "#e9d8a6", "#ee9b00", "#ca6702", "#bb3e03", "#ae2012", "#9b2226")
+ggpaired(fga_as_comp, cond1 = "AS", cond2 = "FGA", facet.by = "var", scales = "free", line.color = "CANCER_TYPE", line.size = 1,
+         fill = "gray65",
+         palette = cols, xlab = "Metric", legend.title = "Cancer type") +
+  stat_compare_means(paired = T) +
+  theme(legend.position = "right")
+ggsave("FGA_vs_AS.pdf", width = 5, height = 5)
+```
+
+```{r}
+fga_as_comp2 <- fga_as_comp %>% 
+  filter(var == "Multivariable hazard ratio") %>%
+  mutate(dir = ifelse(FGA - AS > 0, "FGA superior", "AS superior"))
+fga_as_comp2 <- left_join(fga_as_comp2, mskcc_df %>% drop_na(FGA, aneuploidy_score) %>% group_by(CANCER_TYPE) %>% summarize(m = median(aneuploidy_score))) %>%
+  filter(CANCER_TYPE != "All")
+
+ggboxplot(fga_as_comp2, x = "dir", y = "m", add = "jitter", fill = "dir", 
+          palette = c("#001219",  "#005F73", "#CA6702", "#E9D8A6"), color = "gray65",
+          xlab = "", ylab = "Median aneuploidy score") + 
+  stat_compare_means() +
+  theme(legend.position = "none")
+ggsave("FGA_vs_AS_Boxplot.pdf", width = 4, height = 4)
+```
+
+```{r}
+ggscatter(mskcc_df %>% drop_na(aneuploidy_score, FGA), x = "aneuploidy_score", y = "FGA", 
+          shape = 21, fill = "CANCER_TYPE", palette = cols, xlab = "Aneuploidy score", add = "reg.line", legend.title = "Cancer type", legend = "right") + 
+  stat_cor(method = "spearman")
+ggsave("AS_FGA_Corr.pdf", width = 6, height = 4)
+```
+
+# Specific aSCNAs and IO response
+```{r}
+ascna_calls.w <- ascna_calls %>% 
+  filter(sample %in% mskcc_df$SAMPLE_ID) %>%
+  gather(arm, value, -sample) %>%
+  filter(value %in% c("AMP", "DEL")) %>%
+  unite(arm, arm, value) %>%
+  mutate(arm = paste0("ARM_", arm),
+         X = 1) %>%
+  spread(arm, X, fill = 0) %>%
+  gather(arm, call, contains("ARM"))
+ascna_calls.w <- left_join(mskcc_df %>% select(SAMPLE_ID, CANCER_TYPE, OS_STATUS, OS_MONTHS, TMB_NONSYNONYMOUS, DRUG_TYPE, aneuploidy_score), ascna_calls.w, by = c("SAMPLE_ID" = "sample")) %>%
+  drop_na()
+
+ascna_calls.w <- bind_rows(ascna_calls.w, ascna_calls.w %>% mutate(CANCER_TYPE = "All"))
+
+ascna_calls_results <- ascna_calls.w %>% group_by(CANCER_TYPE, arm) %>%
+  do(cox = summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ call + aneuploidy_score, data = .))) %>%
+  summarize(CANCER_TYPE,
+            arm,
+            p_value = cox$coefficients[1,5],
+            hazard_ratio = cox$coefficients[1,2])
+
+ascna_calls_results_ <- ascna_calls_results %>% separate(arm, into = c("ARM", "arm", "call")) %>%
+  filter(!arm %in% c("Xp", "Xq")) %>%
+  get_q_vals() %>%
+  mutate(signif = ifelse(q_value < 0.05, "S", "NS"),
+         call = ifelse(call == "AMP", "Gain", "Loss"),
+         chrom = as.numeric(gsub("[pq]", "", arm)),
+         arm_pq = gsub("[0-9]+", "", arm)) %>%
+  arrange(desc(chrom), desc(arm_pq))
+
+cols <- c("black", "white", "gray85", "#001219", "#005f73", "#0a9396", "#94d2bd", "#e9d8a6", "#ee9b00", "#ca6702", "#bb3e03", "#ae2012", "#9b2226")
+ggscatter(ascna_calls_results_ %>% mutate(q_value = -log10(q_value)), alpha = 0.75, shape = 21, color = "black",
+          x = "arm", y = "q_value", facet.by = "call", fill = "CANCER_TYPE", legend = "right",
+          palette = cols, legend.title = "Cancer type", ncol = 2) +
+  geom_hline(yintercept = -log10(0.05), lty = 2, color = "gray65") +
+  labs(x = "Chromosome arm", y = "-log10(Q-value)") +
+  coord_flip()
+ggsave("Arm_Enrichment.pdf", width = 10, height = 6)
+```
