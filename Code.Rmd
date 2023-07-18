@@ -12,6 +12,26 @@ library(ggridges)
 library(qvalue)
 ```
 
+# Function for calculating q-values
+```{r}
+get_q_vals <- function(df, p_value_col = "p_value") {
+  if(!p_value_col %in% names(df)) {
+    message("p_value column not found, q-values not computed")
+    return(df)
+  }
+  if(nrow(df) < 2) {
+    message("not enough observations to compute q-values")
+    return(df)
+  }
+  df.mut <- drop_na(df, any_of(p_value_col))
+  df.mut[,p_value_col][df.mut[,p_value_col] >= 1] <- 1
+  df.mut[,p_value_col][df.mut[,p_value_col] <= 0] <- 0
+  df.mut <- cbind(df.mut, q_value = qvalue(unlist(df.mut[,p_value_col]), pi0 = 1)$qvalues)
+  names(df.mut)[names(df.mut) == "q_value"] <- gsub("^p", "q", p_value_col)
+  df.mut
+}
+```
+
 # Load data
 ```{r}
 sample_data <- fread("tmb_mskcc_2018/data_clinical_sample.txt") %>%
